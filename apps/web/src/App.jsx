@@ -390,7 +390,7 @@ export function App() {
 
   function addErrorMessage(message) {
     if (!message) return;
-    setErrorMessages((current) => (current.includes(message) ? current : [...current, message]));
+    setErrorMessages([message]);
   }
 
   function clearErrors() {
@@ -816,7 +816,7 @@ export function App() {
 
   function wireFilesChannel(channel) {
     channel.binaryType = "arraybuffer";
-    channel.bufferedAmountLowThreshold = 1024 * 1024;
+    channel.bufferedAmountLowThreshold = Math.min(1024 * 1024, Math.floor(maxBufferedAmount / 2));
     filesChannelRef.current = channel;
     channel.onopen = () => {
       receiveStateRef.current.startedAt = Date.now();
@@ -1043,11 +1043,13 @@ export function App() {
       for (const fileDescriptor of filesToSend) {
         if (!sendControlMessage("file:start", { transferId, ...fileDescriptor, file: undefined })) return;
         for (let offset = 0; offset < fileDescriptor.size; offset += chunkSize) {
+          if (channel.readyState !== "open") throw new Error("Connection closed during transfer.");
           const chunk = await fileDescriptor.file.slice(offset, offset + chunkSize).arrayBuffer();
           channel.send(chunk);
           transferredBytes += chunk.byteLength;
           updateTransferStats(transferredBytes, totalBytes, startedAt, fileDescriptor.name);
           await waitForBuffer(channel);
+          if (offset % (chunkSize * 4) === 0) await new Promise(r => setTimeout(r, 0));
         }
         if (!sendControlMessage("file:end", { transferId, fileId: fileDescriptor.id })) return;
       }

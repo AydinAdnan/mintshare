@@ -490,6 +490,19 @@ button:hover, .button-label:hover {
 }
 
 @media (max-width: 600px) {
+  .error-block {
+    position: fixed;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: calc(100% - 32px);
+    max-width: 400px;
+    z-index: 9999;
+    background: rgba(43, 20, 20, 0.95);
+    backdrop-filter: blur(8px);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  }
+
   .brand-header {
     margin-bottom: 1rem;
   }
