@@ -59,6 +59,41 @@ body {
   padding: 24px;
 }
 
+.toast-stack {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: min(360px, calc(100vw - 32px));
+  z-index: 30;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border: 1px solid #3d3d3d;
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+  background: rgba(10, 10, 10, 0.94);
+  color: #fff;
+}
+
+.toast-error {
+  border-color: #5a5a5a;
+}
+
+.toast-close {
+  border: none;
+  padding: 0;
+  background: transparent;
+  color: #b7b7b7;
+  font-size: 0.82rem;
+}
+
 .card {
   background: transparent;
   text-align: center;
@@ -276,6 +311,81 @@ button:hover, .button-label:hover {
   line-height: 1.45;
 }
 
+.download-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.download-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.download-item {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0.85rem 0.9rem;
+  border: 1px solid #2b2b2b;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.download-item input {
+  accent-color: #fff;
+}
+
+.download-item-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.download-item-text strong,
+.download-item-text span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-item-text strong {
+  font-size: 0.95rem;
+  color: #fff;
+}
+
+.download-item-text span {
+  font-size: 0.82rem;
+  color: #8e8e8e;
+}
+
+.download-inline-button {
+  padding: 0.55rem 0.9rem;
+  font-size: 0.85rem;
+}
+
+.download-button {
+  width: 100%;
+}
+
+.download-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.complete-note {
+  color: #8e8e8e;
+}
+
 .transfer-stats {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -323,6 +433,13 @@ button:hover, .button-label:hover {
 }
 
 @media (max-width: 600px) {
+  .toast-stack {
+    top: 12px;
+    right: 12px;
+    left: 12px;
+    width: auto;
+  }
+
   .app-main {
     align-items: center;
     padding: 20px 16px 32px;
@@ -371,5 +488,14 @@ button:hover, .button-label:hover {
   .qr-container svg {
     width: 132px;
     height: 132px;
+  }
+
+  .download-item {
+    grid-template-columns: auto 1fr;
+  }
+
+  .download-inline-button {
+    grid-column: 1 / -1;
+    width: 100%;
   }
 }

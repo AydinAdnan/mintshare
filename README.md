@@ -139,6 +139,8 @@ VITE_TURN_USERNAME=example-user
 VITE_TURN_CREDENTIAL=example-password
 ```
 
+For a full production guide, including managed TURN and self-hosted coturn options, see [TURN_SETUP.md](TURN_SETUP.md).
+
 ## Notes
 
 - WebRTC encrypts transport in transit with DTLS.

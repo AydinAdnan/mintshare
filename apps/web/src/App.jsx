@@ -5,6 +5,7 @@ import { parseControlMessage } from "@fileshare/protocol";
 const signalUrl = import.meta.env.VITE_SIGNAL_URL || `ws://${window.location.hostname}:3001`;
 const chunkSize = 64 * 1024;
 const maxBufferedAmount = 4 * 1024 * 1024;
+const hasTurnConfigured = Boolean(import.meta.env.VITE_TURN_URLS?.trim());
 const roomCodeAlphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const TransferScene = lazy(() => import("./TransferScene.jsx").then((module) => ({ default: module.TransferScene })));
 
@@ -72,6 +73,16 @@ function sanitizeRoomCode(value) {
     .slice(0, 6);
 }
 
+function triggerBrowserDownload(url, fileName) {
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
 const CircularProgress = ({ progress }) => {
   const radius = 100;
   const stroke = 12;
@@ -117,6 +128,9 @@ export function App() {
   const [joinCode, setJoinCode] = useState("");
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [receivedFiles, setReceivedFiles] = useState([]);
+  const [selectedDownloadIds, setSelectedDownloadIds] = useState([]);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [notifications, setNotifications] = useState([]);
   const [pairingMessage, setPairingMessage] = useState("");
   const [pairingError, setPairingError] = useState("");
   const [transferError, setTransferError] = useState("");
@@ -199,10 +213,29 @@ export function App() {
     filesRef.current = selectedFiles;
   }, [selectedFiles]);
 
+  useEffect(() => {
+    if (mode !== "receiver") return;
+    const completeIds = receivedFiles.filter((file) => file.status === "complete" && file.downloadUrl).map((file) => file.id);
+    setSelectedDownloadIds((current) => {
+      const currentSet = new Set(current);
+      let changed = current.length !== completeIds.length;
+      if (!changed) {
+        for (const id of completeIds) {
+          if (!currentSet.has(id)) {
+            changed = true;
+            break;
+          }
+        }
+      }
+      return changed ? completeIds : current;
+    });
+  }, [mode, receivedFiles]);
+
   function resetRealtimeState() {
     manifestSentRef.current = false;
     transferActiveRef.current = false;
     transferIdRef.current = "";
+    setArchiveBusy(false);
     setTransferError("");
     setStats({
       totalBytes: 0,
@@ -235,9 +268,19 @@ export function App() {
     setJoinCode("");
     setCode("");
     setSelectedFiles([]);
+    setReceivedFiles([]);
+    setSelectedDownloadIds([]);
     setPairingMessage("");
     setPairingError("");
     setTransferError("");
+  }
+
+  function pushNotification(message, kind = "info") {
+    const id = crypto.randomUUID();
+    setNotifications((current) => [...current, { id, message, kind }]);
+    window.setTimeout(() => {
+      setNotifications((current) => current.filter((notification) => notification.id !== id));
+    }, 4200);
   }
 
   function showPairingError(message, fallbackStep = null) {
@@ -254,6 +297,84 @@ export function App() {
     if (fallbackStep) {
       setUiStep(fallbackStep);
     }
+  }
+
+  async function saveReceivedFile(file) {
+    if (!file?.downloadUrl) {
+      showTransferError("The received file is not ready to save yet.", uiStepRef.current);
+      return;
+    }
+
+    try {
+      if (navigator.share && navigator.canShare && file.blob) {
+        const shareFile = new File([file.blob], toDownloadName(file.relativePath || file.name), {
+          type: file.mimeType || file.blob.type || "application/octet-stream",
+          lastModified: file.lastModified || Date.now(),
+        });
+
+        if (navigator.canShare({ files: [shareFile] })) {
+          await navigator.share({ files: [shareFile], title: file.name });
+          return;
+        }
+      }
+
+      triggerBrowserDownload(file.downloadUrl, toDownloadName(file.relativePath || file.name));
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      console.error(error);
+      showTransferError("Your browser could not save the received file automatically. Try again.", uiStepRef.current);
+    }
+  }
+
+  async function downloadSelectedFiles() {
+    const filesToDownload = receivedFiles.filter((file) => selectedDownloadIds.includes(file.id) && file.downloadUrl);
+    if (filesToDownload.length === 0) {
+      showTransferError("Select at least one file to download.", uiStepRef.current);
+      return;
+    }
+
+    for (const file of filesToDownload) {
+      await saveReceivedFile(file);
+    }
+  }
+
+  async function downloadSelectedAsZip() {
+    const filesToZip = receivedFiles.filter((file) => selectedDownloadIds.includes(file.id) && file.blob);
+    if (filesToZip.length === 0) {
+      showTransferError("Select at least one file to download as a zip.", uiStepRef.current);
+      return;
+    }
+
+    setArchiveBusy(true);
+    try {
+      const { default: JSZip } = await import("jszip");
+      const zip = new JSZip();
+
+      filesToZip.forEach((file) => {
+        zip.file(file.relativePath || file.name, file.blob);
+      });
+
+      const archiveBlob = await zip.generateAsync({ type: "blob" });
+      const archiveUrl = URL.createObjectURL(archiveBlob);
+      try {
+        triggerBrowserDownload(archiveUrl, `fileshare-${Date.now()}.zip`);
+      } finally {
+        window.setTimeout(() => URL.revokeObjectURL(archiveUrl), 60_000);
+      }
+    } catch (error) {
+      console.error(error);
+      showTransferError("Could not prepare the zip archive.", uiStepRef.current);
+    } finally {
+      setArchiveBusy(false);
+    }
+  }
+
+  function toggleDownloadSelection(fileId) {
+    setSelectedDownloadIds((current) => (
+      current.includes(fileId)
+        ? current.filter((id) => id !== fileId)
+        : [...current, fileId]
+    ));
   }
 
   function sendSignal(type, payload) {
@@ -394,11 +515,6 @@ export function App() {
         currentReceive.currentFileId = null;
         currentReceive.currentFileMeta = null;
 
-        // Auto trigger download for singular files to be super seamless
-        const link = document.createElement('a');
-        link.href = downloadUrl;
-        link.download = toDownloadName(fileMeta?.relativePath || "download");
-        link.click();
         return;
       }
 
@@ -460,11 +576,13 @@ export function App() {
     channel.onmessage = handleControlChannelMessage;
     channel.onerror = () => {
       showTransferError("The control channel failed during transfer setup.");
+      pushNotification("The control connection failed.", "error");
     };
     channel.onclose = () => {
       if (uiStepRef.current === "complete") return;
       if (transferActiveRef.current || uiStepRef.current === "transferring") {
         showTransferError("The connection to the other device was lost during transfer.");
+        pushNotification("The other device ended the transfer.", "error");
       }
     };
   }
@@ -481,11 +599,13 @@ export function App() {
     channel.onmessage = handleDataChannelMessage;
     channel.onerror = () => {
       showTransferError("The file data channel failed.");
+      pushNotification("The file channel failed.", "error");
     };
     channel.onclose = () => {
       if (uiStepRef.current === "complete") return;
       if (transferActiveRef.current || uiStepRef.current === "transferring") {
         showTransferError("The file transfer stopped because the data channel closed.");
+        pushNotification("The file transfer was terminated.", "error");
       }
     };
   }
@@ -505,17 +625,23 @@ export function App() {
     peer.onconnectionstatechange = () => {
       if (peer.connectionState === "failed") {
         showTransferError("Peer connection failed. The devices could not establish a direct link.");
+        pushNotification("Peer connection failed.", "error");
       }
 
       if (peer.connectionState === "disconnected") {
         if (uiStepRef.current === "complete") return;
         showTransferError("The other device disconnected.");
+        pushNotification("The other device disconnected.", "error");
       }
     };
 
     peer.oniceconnectionstatechange = () => {
       if (peer.iceConnectionState === "failed") {
-        showTransferError("Network path discovery failed. Try both devices on the same network.");
+        showTransferError(
+          hasTurnConfigured
+            ? "Network path discovery failed. Try both devices on the same network or retry the transfer."
+            : "Direct device connection failed. Mobile and cross-network transfers usually need a TURN relay server."
+        );
       }
     };
 
@@ -574,6 +700,7 @@ export function App() {
       }
       if (message.type === "room:expired" || message.type === "room:peer-left") {
         showPairingError(message.type === "room:peer-left" ? "The other device left." : "This code expired.", modeRef.current === "sender" ? "home" : "input");
+        pushNotification(message.type === "room:peer-left" ? "The other device terminated the connection." : "The pairing code expired.", "error");
         joinAttemptRef.current = "";
         return;
       }
@@ -639,16 +766,19 @@ export function App() {
     });
     socket.addEventListener("error", () => {
       showPairingError("Unable to reach the pairing server.", nextMode === "sender" ? "home" : "input");
+      pushNotification("The pairing server could not be reached.", "error");
     });
     socket.addEventListener("close", () => {
       if (transferActiveRef.current) return;
       if (uiStepRef.current === "complete") return;
       if (nextMode === "sender" && !roomCodeRef.current) {
         showPairingError("Connection closed before a pairing code was created.", "home");
+        pushNotification("The sender connection was closed.", "error");
         return;
       }
       if (uiStepRef.current === "code" || uiStepRef.current === "input") {
         showPairingError("Pairing server connection was closed.", nextMode === "sender" ? "home" : "input");
+        pushNotification("The pairing connection was closed.", "error");
       }
     });
   }
@@ -726,6 +856,8 @@ export function App() {
 
   const progressRatio = stats.totalBytes > 0 ? stats.transferredBytes / stats.totalBytes : 0;
   const qrValue = code ? `${window.location.origin}/#join=${code}` : "";
+  const completedReceivedFiles = receivedFiles.filter((file) => file.status === "complete" && file.downloadUrl);
+  const selectedCompleteFiles = completedReceivedFiles.filter((file) => selectedDownloadIds.includes(file.id));
 
   return (
     <main className="app-main">
@@ -734,6 +866,19 @@ export function App() {
       </Suspense>
 
       <div className="overlay-ui">
+        {notifications.length > 0 ? (
+          <div className="toast-stack" aria-live="polite" aria-atomic="true">
+            {notifications.map((notification) => (
+              <div key={notification.id} className={`toast toast-${notification.kind}`}>
+                <span>{notification.message}</span>
+                <button type="button" className="toast-close" onClick={() => setNotifications((current) => current.filter((item) => item.id !== notification.id))}>
+                  Close
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
         {uiStep === "home" && (
           <div className="card fade-in home-card">
             <h1>Share</h1>
@@ -816,7 +961,47 @@ export function App() {
           <div className="card scale-in success-card">
             <div className="check-icon">✓</div>
             <h2>Transfer Complete!</h2>
-            <p>Your files have been successfully {mode === 'sender' ? 'sent' : 'downloaded'}.</p>
+            <p>{mode === 'sender' ? 'Your files have been successfully sent.' : 'Choose which received files you want to save.'}</p>
+            {mode === "receiver" && completedReceivedFiles.length > 0 ? (
+              <div className="download-actions">
+                <p className="complete-note">Select files below, then download them individually or as a zip archive.</p>
+                <div className="download-list">
+                  {completedReceivedFiles.map((file) => (
+                    <label key={file.id} className="download-item">
+                      <input
+                        type="checkbox"
+                        checked={selectedDownloadIds.includes(file.id)}
+                        onChange={() => toggleDownloadSelection(file.id)}
+                      />
+                      <span className="download-item-text">
+                        <strong>{file.name}</strong>
+                        <span>{formatBytes(file.size)}</span>
+                      </span>
+                      <button
+                        className="secondary-btn download-inline-button"
+                        type="button"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          void saveReceivedFile(file);
+                        }}
+                      >
+                        Save
+                      </button>
+                    </label>
+                  ))}
+                </div>
+                <div className="download-toolbar">
+                  <button className="secondary-btn download-button" type="button" onClick={() => void downloadSelectedFiles()}>
+                    Download Selected ({selectedCompleteFiles.length})
+                  </button>
+                  <button className="primary-btn download-button" type="button" disabled={archiveBusy} onClick={() => void downloadSelectedAsZip()}>
+                    {archiveBusy ? "Preparing Zip..." : `Download as Zip (${selectedCompleteFiles.length})`}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+            {transferError ? <p className="error-text error-block">{transferError}</p> : null}
             <button className="primary-btn mt" onClick={goHome}>Done</button>
           </div>
         )}
