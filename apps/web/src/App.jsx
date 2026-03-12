@@ -201,10 +201,12 @@ export function App() {
   const pendingManifestRef = useRef(null);
   const joinAttemptRef = useRef("");
   const intentionalCloseRef = useRef(false);
+  const errorTimeoutRef = useRef(null);
   const uiStepRef = useRef("home");
   const modeRef = useRef("sender");
   const receiveStateRef = useRef({
     transferId: "",
+    acceptedFileIds: [],
     currentFileId: null,
     currentFileMeta: null,
     chunks: new Map(),
@@ -300,6 +302,34 @@ export function App() {
       return changed ? completeIds : current;
     });
   }, [mode, receivedFiles]);
+
+  useEffect(() => {
+    if (!pairingError && !transferError && errorMessages.length === 0) {
+      if (errorTimeoutRef.current) {
+        window.clearTimeout(errorTimeoutRef.current);
+        errorTimeoutRef.current = null;
+      }
+      return;
+    }
+
+    if (errorTimeoutRef.current) {
+      window.clearTimeout(errorTimeoutRef.current);
+    }
+
+    errorTimeoutRef.current = window.setTimeout(() => {
+      setPairingError("");
+      setTransferError("");
+      setErrorMessages([]);
+      errorTimeoutRef.current = null;
+    }, 10000);
+
+    return () => {
+      if (errorTimeoutRef.current) {
+        window.clearTimeout(errorTimeoutRef.current);
+        errorTimeoutRef.current = null;
+      }
+    };
+  }, [pairingError, transferError, errorMessages]);
 
   function resetRealtimeState() {
     manifestSentRef.current = false;
@@ -548,6 +578,7 @@ export function App() {
     }
 
     receiveStateRef.current.transferId = manifest.transferId;
+    receiveStateRef.current.acceptedFileIds = selectedFileIds;
     receiveStateRef.current.receivedBytes = 0;
     receiveStateRef.current.startedAt = Date.now();
     receiveStateRef.current.lastCheckpointAt = Date.now();
@@ -585,9 +616,21 @@ export function App() {
     acceptTransfer(pendingManifestRef.current, selectedReceiveIds);
   }
 
+  // Messages the sender side should process from the peer (receiver)
+  const SENDER_ALLOWED_TYPES = new Set(["transfer:accept", "transfer:error"]);
+  // Messages the receiver side should process from the peer (sender)
+  const RECEIVER_ALLOWED_TYPES = new Set(["transfer:manifest", "file:start", "file:end", "transfer:complete", "transfer:error"]);
+
   function handleControlChannelMessage(rawMessage) {
     try {
       const message = parseControlMessage(JSON.parse(rawMessage.data));
+
+      // Role-based message filtering: reject messages that should not arrive for this role
+      const allowedTypes = modeRef.current === "sender" ? SENDER_ALLOWED_TYPES : RECEIVER_ALLOWED_TYPES;
+      if (!allowedTypes.has(message.type)) {
+        console.warn("Rejected unexpected control message type for role:", message.type, modeRef.current);
+        return;
+      }
 
       if (message.type === "transfer:manifest") {
         pendingManifestRef.current = message.payload;
@@ -637,6 +680,17 @@ export function App() {
       }
 
       if (message.type === "file:start") {
+        // Validate transferId matches session
+        if (message.payload.transferId !== receiveStateRef.current.transferId) {
+          console.warn("Rejected file:start with mismatched transferId");
+          return;
+        }
+        // Validate file was part of the accepted manifest
+        const acceptedIds = new Set(receiveStateRef.current.acceptedFileIds || []);
+        if (acceptedIds.size > 0 && !acceptedIds.has(message.payload.id)) {
+          console.warn("Rejected file:start for non-accepted file");
+          return;
+        }
         receiveStateRef.current.currentFileId = message.payload.id;
         receiveStateRef.current.currentFileMeta = message.payload;
         receiveStateRef.current.chunks.set(message.payload.id, []);
@@ -644,7 +698,8 @@ export function App() {
           id: message.payload.id,
           name: message.payload.name,
           relativePath: message.payload.relativePath,
-          mimeType: message.payload.mimeType,
+          // Always override MIME type — never trust the sender's MIME claim for blob rendering
+          mimeType: "application/octet-stream",
           size: message.payload.size,
           lastModified: message.payload.lastModified,
           receivedBytes: 0,
@@ -656,9 +711,14 @@ export function App() {
 
       if (message.type === "file:end") {
         const currentReceive = receiveStateRef.current;
+        // Validate transferId matches session
+        if (message.payload.transferId !== currentReceive.transferId) {
+          console.warn("Rejected file:end with mismatched transferId");
+          return;
+        }
         const fileMeta = currentReceive.currentFileMeta;
         const chunks = currentReceive.chunks.get(message.payload.fileId) || [];
-        const blob = new Blob(chunks, { type: fileMeta?.mimeType || "application/octet-stream" });
+        const blob = new Blob(chunks, { type: "application/octet-stream" });
         const downloadUrl = URL.createObjectURL(blob);
         upsertReceivedFile({
           id: message.payload.fileId,
@@ -688,11 +748,24 @@ export function App() {
     }
   }
 
+  // Maximum bytes allowed beyond the declared file size before aborting (1 MB tolerance)
+  const MAX_OVERSIZE_BYTES = 1024 * 1024;
+
   function handleDataChannelMessage(event) {
     if (!(event.data instanceof ArrayBuffer)) return;
 
     const currentReceive = receiveStateRef.current;
     if (!currentReceive.currentFileId || !currentReceive.currentFileMeta) return;
+
+    // Memory exhaustion guard: reject chunks that exceed the declared file size
+    const fileMeta = currentReceive.currentFileMeta;
+    const existingChunks = currentReceive.chunks.get(currentReceive.currentFileId) || [];
+    const alreadyReceived = existingChunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+    if (fileMeta && alreadyReceived + event.data.byteLength > fileMeta.size + MAX_OVERSIZE_BYTES) {
+      showTransferError("Transfer aborted: sender sent more data than declared. Possible attack.");
+      cancelTransfer();
+      return;
+    }
 
     const chunks = currentReceive.chunks.get(currentReceive.currentFileId) || [];
     chunks.push(event.data);
@@ -870,10 +943,12 @@ export function App() {
         return;
       }
       if (message.type === "signal:ice-candidate") {
+        // Cap the pending candidates queue to prevent memory exhaustion via flooding
+        const MAX_PENDING_CANDIDATES = 100;
         const candidate = new RTCIceCandidate(message.payload.candidate);
         if (peerRef.current?.remoteDescription) {
           await peerRef.current.addIceCandidate(candidate);
-        } else {
+        } else if (pendingCandidatesRef.current.length < MAX_PENDING_CANDIDATES) {
           pendingCandidatesRef.current.push(candidate);
         }
       }
@@ -1253,6 +1328,9 @@ export function App() {
             <button className="primary-btn mt" onClick={goHome}>Done</button>
           </div>
         )}
+      </div>
+      <div style={{ position: 'absolute', bottom: '16px', fontSize: '0.85rem', color: 'rgba(255, 255, 255, 0.5)', textAlign: 'center', width: '100%' }}>
+        Made by Aydin
       </div>
     </main>
   );

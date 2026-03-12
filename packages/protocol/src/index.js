@@ -54,18 +54,18 @@ export const chunkHeaderSchema = z.object({
 });
 
 export const manifestFileSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  relativePath: z.string(),
-  mimeType: z.string(),
-  size: z.number().int().nonnegative(),
+  id: z.string().uuid(),
+  name: z.string().min(1).max(512),
+  relativePath: z.string().min(1).max(4096),
+  mimeType: z.string().max(255).regex(/^[a-zA-Z0-9][a-zA-Z0-9!\#$&\-^_]*\/[a-zA-Z0-9][a-zA-Z0-9!\#$&\-^_.+]*$/).default("application/octet-stream"),
+  size: z.number().int().nonnegative().max(50 * 1024 * 1024 * 1024), // 50 GB per-file cap
   lastModified: z.number().int().nonnegative(),
 });
 
 export const transferManifestSchema = z.object({
-  transferId: z.string(),
-  totalBytes: z.number().int().nonnegative(),
-  files: z.array(manifestFileSchema).min(1),
+  transferId: z.string().uuid(),
+  totalBytes: z.number().int().nonnegative().max(200 * 1024 * 1024 * 1024), // 200 GB total cap
+  files: z.array(manifestFileSchema).min(1).max(500),
 });
 
 export const controlMessageSchema = z.discriminatedUnion("type", [
@@ -76,28 +76,28 @@ export const controlMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("transfer:accept"),
     payload: z.object({
-      transferId: z.string(),
-      selectedFileIds: z.array(z.string()).min(1),
+      transferId: z.string().uuid(),
+      selectedFileIds: z.array(z.string().uuid()).min(1).max(500),
     }),
   }),
   z.object({
     type: z.literal("file:start"),
     payload: manifestFileSchema.extend({
-      transferId: z.string(),
+      transferId: z.string().uuid(),
     }),
   }),
   z.object({
     type: z.literal("file:end"),
     payload: z.object({
-      transferId: z.string(),
-      fileId: z.string(),
+      transferId: z.string().uuid(),
+      fileId: z.string().uuid(),
     }),
   }),
   z.object({
     type: z.literal("transfer:progress"),
     payload: z.object({
-      transferId: z.string(),
-      fileId: z.string(),
+      transferId: z.string().uuid(),
+      fileId: z.string().uuid(),
       receivedBytes: z.number().int().nonnegative(),
       totalBytes: z.number().int().nonnegative(),
       bytesPerSecond: z.number().nonnegative(),
@@ -107,15 +107,15 @@ export const controlMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("transfer:complete"),
     payload: z.object({
-      transferId: z.string(),
-      fileId: z.string().optional(),
+      transferId: z.string().uuid(),
+      fileId: z.string().uuid().optional(),
     }),
   }),
   z.object({
     type: z.literal("transfer:error"),
     payload: z.object({
-      transferId: z.string(),
-      message: z.string(),
+      transferId: z.string().uuid(),
+      message: z.string().max(500),
     }),
   }),
 ]);

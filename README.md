@@ -2,6 +2,30 @@
 
 Browser-to-browser file sharing built with JavaScript, React, Vite, WebRTC data channels, and a lightweight Node.js `ws` signaling server.
 
+## What MintShare uses
+
+### Core technologies
+
+- `React` for the sender and receiver user interface
+- `Vite` for fast local development and production bundling
+- `Node.js` for the signaling backend runtime
+- `ws` for persistent WebSocket signaling between browser and server
+- `WebRTC` for the direct browser-to-browser connection
+- `Three.js` for the lightweight animated visual layer
+- `JSZip` for receiver-side zip generation in the browser
+- `Zod` in `packages/protocol` to validate shared control-message formats
+
+### Network protocols and what they do
+
+- `HTTPS` serves the frontend securely in production
+- `WebSocket` carries room creation, join, offer, answer, and ICE-candidate signaling messages
+- `WebRTC` creates the actual peer-to-peer transport between the two browsers
+- `ICE` finds a working network path between sender and receiver
+- `STUN` helps each browser discover its public-facing network address
+- `TURN` relays traffic when direct peer-to-peer connectivity is blocked by NATs, firewalls, mobile networks, or restrictive Wi-Fi
+- `DTLS` encrypts the WebRTC transport in transit
+- `SCTP` runs underneath the WebRTC data channel and provides reliable ordered delivery for file bytes
+
 ## Current implementation
 
 - Six-character room code generation with QR join link
@@ -13,6 +37,78 @@ Browser-to-browser file sharing built with JavaScript, React, Vite, WebRTC data 
 - Individual receiver downloads per file
 - Download-all zip generation in the browser
 - Lightweight Three.js visual layer
+
+## How it works
+
+### High-level flow
+
+1. The sender selects one or more files in the web app.
+2. The app opens a WebSocket connection to the signaling server and creates a six-character room code.
+3. The receiver joins with the code or QR link.
+4. The signaling server only coordinates setup. It does not store the files.
+5. The two browsers exchange WebRTC offer, answer, and ICE-candidate messages over WebSocket.
+6. Once the WebRTC connection is ready, the sender shares a transfer manifest listing file metadata.
+7. The receiver explicitly chooses which files to accept.
+8. Only the approved files are streamed over the WebRTC file data channel in chunks.
+9. The receiver reconstructs files locally in memory and can either download individual files or generate a zip archive in the browser.
+
+### Data-path model
+
+- `Signaling path`: browser -> WebSocket server -> browser
+- `File path`: browser -> WebRTC data channel -> browser
+
+This separation matters because the signaling server is only used to establish the connection. After pairing, the file bytes go directly between devices unless a TURN relay is needed.
+
+### Transfer behavior
+
+- Files are sent sequentially for better stability over a single reliable data channel.
+- Each file is split into `256 KB` chunks by default.
+- Backpressure is controlled through the data channel buffered-amount threshold to avoid overwhelming the browser.
+- Progress, throughput, and ETA are calculated live on the client.
+- Downloads are manual only. Nothing auto-downloads on receipt.
+
+## Architecture
+
+### Frontend
+
+- `apps/web` contains the React app.
+- The sender and receiver flows live in the same app and switch by UI state.
+- The app manages room setup, WebRTC negotiation, file manifests, transfer progress, and manual downloads.
+
+### Signaling server
+
+- `apps/signal` hosts a lightweight WebSocket server.
+- It manages room creation, room joins, and forwarding of signaling messages.
+- It includes payload limits, origin allowlisting, and heartbeat cleanup for production use.
+
+### Shared protocol package
+
+- `packages/protocol` defines the control-message schema shared across the app.
+- This reduces protocol drift between frontend behavior and signaling expectations.
+
+## How good it is
+
+### Where MintShare is strong
+
+- Very efficient for browser-based file transfer because file bytes do not pass through your app server in the normal case.
+- Fast on local or well-connected networks because WebRTC data channels avoid extra upload-download hops through central storage.
+- Good privacy characteristics compared with server-stored file sharing because the server coordinates pairing rather than holding the content.
+- Works well for ad hoc transfers between desktop browsers and between mixed devices when TURN is configured correctly.
+- Lightweight operational model because the backend is only a signaling service, not a file-hosting platform.
+
+### Practical limits
+
+- Reliability across mobile networks or enterprise Wi-Fi depends heavily on TURN availability.
+- Large transfers are constrained by browser memory because received files and zip generation are currently handled client-side.
+- This is a live-session transfer tool, not a persistent cloud-storage system.
+- If either browser tab closes or the connection drops, the transfer does not resume automatically.
+- The current implementation is optimized for one sender and one receiver per room.
+
+### Realistic assessment
+
+- For direct browser-based transfer, this is a strong architecture: simple, fast, and cost-efficient.
+- For production, it is good if you provide stable TURN infrastructure and host the signaling server on a WebSocket-friendly platform.
+- For very large files, resumability, auditability, or enterprise-grade control, it would still need additional hardening beyond the current baseline.
 
 ## Workspace
 

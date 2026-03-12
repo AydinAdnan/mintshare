@@ -12,8 +12,73 @@ const allowedOrigins = new Set(
     .map((value) => value.trim())
     .filter(Boolean)
 );
+
+// Security limits
+const MAX_CONNECTIONS_PER_IP = Number(process.env.MAX_CONNECTIONS_PER_IP || 10);
+const MAX_ROOMS_TOTAL = Number(process.env.MAX_ROOMS_TOTAL || 2000);
+const MAX_ROOMS_PER_IP = Number(process.env.MAX_ROOMS_PER_IP || 3);
+const JOIN_RATE_WINDOW_MS = 60_000;
+const MAX_JOINS_PER_WINDOW = Number(process.env.MAX_JOINS_PER_WINDOW || 20);
+
+// ip -> connection count
+const connectionsPerIp = new Map();
+// ip -> { count, windowStart }
+const joinAttemptsPerIp = new Map();
+// ip -> active room count
+const roomsPerIp = new Map();
+
 const rooms = new Map();
 const alphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+function getIp(request) {
+  const forwarded = request.headers["x-forwarded-for"];
+  return (forwarded ? forwarded.split(",")[0].trim() : null) || request.socket.remoteAddress || "unknown";
+}
+
+function trackConnect(ip) {
+  connectionsPerIp.set(ip, (connectionsPerIp.get(ip) || 0) + 1);
+}
+
+function trackDisconnect(ip) {
+  const current = connectionsPerIp.get(ip) || 0;
+  if (current <= 1) {
+    connectionsPerIp.delete(ip);
+  } else {
+    connectionsPerIp.set(ip, current - 1);
+  }
+}
+
+function isConnectionLimitExceeded(ip) {
+  return (connectionsPerIp.get(ip) || 0) >= MAX_CONNECTIONS_PER_IP;
+}
+
+function isJoinRateLimitExceeded(ip) {
+  const now = Date.now();
+  const entry = joinAttemptsPerIp.get(ip);
+  if (!entry || now - entry.windowStart > JOIN_RATE_WINDOW_MS) {
+    joinAttemptsPerIp.set(ip, { count: 1, windowStart: now });
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > MAX_JOINS_PER_WINDOW;
+}
+
+function trackRoomCreated(ip) {
+  roomsPerIp.set(ip, (roomsPerIp.get(ip) || 0) + 1);
+}
+
+function trackRoomRemoved(ip) {
+  const current = roomsPerIp.get(ip) || 0;
+  if (current <= 1) {
+    roomsPerIp.delete(ip);
+  } else {
+    roomsPerIp.set(ip, current - 1);
+  }
+}
+
+function isRoomLimitExceeded(ip) {
+  return (roomsPerIp.get(ip) || 0) >= MAX_ROOMS_PER_IP;
+}
 
 function generateCode() {
   let code = "";
@@ -23,20 +88,28 @@ function generateCode() {
   return code;
 }
 
-function createRoom(senderSocket) {
+function createRoom(senderSocket, creatorIp) {
+  if (rooms.size >= MAX_ROOMS_TOTAL) return null;
+  if (isRoomLimitExceeded(creatorIp)) return null;
+
   let code = generateCode();
+  let attempts = 0;
   while (rooms.has(code)) {
     code = generateCode();
+    attempts += 1;
+    if (attempts > 100) return null;
   }
 
   const room = {
     code,
     createdAt: Date.now(),
+    creatorIp,
     sender: senderSocket,
     receiver: null,
   };
 
   rooms.set(code, room);
+  trackRoomCreated(creatorIp);
   return room;
 }
 
@@ -44,6 +117,11 @@ function sendJson(socket, message) {
   if (socket && socket.readyState === 1) {
     socket.send(JSON.stringify(message));
   }
+}
+
+// Never expose internal error details to the client
+function sendSafeError(socket, genericMessage) {
+  sendJson(socket, { type: "room:error", payload: { message: genericMessage } });
 }
 
 function destroyRoom(code, reasonType = null) {
@@ -55,6 +133,7 @@ function destroyRoom(code, reasonType = null) {
     sendJson(room.receiver, { type: reasonType, payload: { code } });
   }
 
+  trackRoomRemoved(room.creatorIp);
   rooms.delete(code);
 }
 
@@ -95,6 +174,16 @@ wss.on("connection", (socket, request) => {
     return;
   }
 
+  const ip = getIp(request);
+
+  // Enforce per-IP connection limit
+  if (isConnectionLimitExceeded(ip)) {
+    socket.close(1008, "Too many connections");
+    return;
+  }
+  trackConnect(ip);
+  socket.clientIp = ip;
+
   socket.isAlive = true;
   socket.on("pong", () => {
     socket.isAlive = true;
@@ -105,7 +194,16 @@ wss.on("connection", (socket, request) => {
       const message = parseSignalMessage(JSON.parse(raw.toString()));
 
       if (message.type === "room:create") {
-        const room = createRoom(socket);
+        // Only allow room creation if no room already tied to this socket
+        if (socket.roomCode) {
+          sendSafeError(socket, "Already in a room");
+          return;
+        }
+        const room = createRoom(socket, socket.clientIp);
+        if (!room) {
+          sendSafeError(socket, "Could not create room. Try again later.");
+          return;
+        }
         socket.roomCode = room.code;
         socket.role = "sender";
         sendJson(socket, { type: "room:created", payload: { code: room.code } });
@@ -113,9 +211,21 @@ wss.on("connection", (socket, request) => {
       }
 
       if (message.type === "room:join") {
+        // Rate-limit join attempts from this IP
+        if (isJoinRateLimitExceeded(socket.clientIp)) {
+          sendSafeError(socket, "Too many join attempts. Wait a moment and try again.");
+          return;
+        }
+
         const room = rooms.get(message.payload.code);
         if (!room || room.receiver) {
-          sendJson(socket, { type: "room:error", payload: { message: "Room unavailable" } });
+          sendSafeError(socket, "Room unavailable");
+          return;
+        }
+
+        // Prevent self-join: sender cannot join their own room
+        if (room.sender === socket) {
+          sendSafeError(socket, "Room unavailable");
           return;
         }
 
@@ -127,25 +237,37 @@ wss.on("connection", (socket, request) => {
         return;
       }
 
-      const room = rooms.get(message.payload.code);
-      if (!room) {
-        sendJson(socket, { type: "room:error", payload: { message: "Room not found" } });
+      // All remaining messages must reference a room the socket is already in
+      const room = rooms.get(socket.roomCode);
+      if (!room || !socket.role) {
+        sendSafeError(socket, "Room not found");
+        return;
+      }
+
+      // Enforce role-based message direction:
+      // only senders send offer/answer/ice-candidate after acting as initiator,
+      // but both roles may send ice-candidates; reject messages targeting the wrong room code
+      if (message.payload.code && message.payload.code !== socket.roomCode) {
+        sendSafeError(socket, "Room mismatch");
         return;
       }
 
       const peer = socket === room.sender ? room.receiver : room.sender;
       if (!peer) {
-        sendJson(socket, { type: "room:error", payload: { message: "Peer not connected" } });
+        sendSafeError(socket, "Peer not connected");
         return;
       }
 
       sendJson(peer, message);
-    } catch (error) {
-      sendJson(socket, { type: "room:error", payload: { message: error.message || "Invalid message" } });
+    } catch {
+      // Never leak internal error details
+      sendSafeError(socket, "Invalid message");
     }
   });
 
   socket.on("close", () => {
+    trackDisconnect(socket.clientIp);
+
     if (!socket.roomCode) {
       return;
     }
@@ -157,6 +279,7 @@ wss.on("connection", (socket, request) => {
 
     const peer = socket === room.sender ? room.receiver : room.sender;
     sendJson(peer, { type: "room:peer-left", payload: { code: room.code } });
+    trackRoomRemoved(room.creatorIp);
     rooms.delete(room.code);
   });
 });
