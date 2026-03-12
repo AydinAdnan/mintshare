@@ -50,6 +50,8 @@ The React app in `apps/web` can be deployed to Vercel.
 
 This repository already includes a root `vercel.json` that builds the web workspace and publishes `apps/web/dist`.
 
+The Vite build is configured to emit the production bundle to the repository root `dist` directory so Vercel can detect it consistently in this monorepo.
+
 In Vercel:
 
 1. Import the repository.

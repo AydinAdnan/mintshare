@@ -3,5 +3,5 @@
   "framework": "vite",
   "installCommand": "npm install",
   "buildCommand": "npm run build --workspace @fileshare/web",
-  "outputDirectory": "apps/web/dist"
+  "outputDirectory": "dist"
 }
