@@ -77,6 +77,7 @@ export const controlMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("transfer:accept"),
     payload: z.object({
       transferId: z.string(),
+      selectedFileIds: z.array(z.string()).min(1),
     }),
   }),
   z.object({

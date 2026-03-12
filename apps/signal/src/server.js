@@ -4,6 +4,14 @@ import { parseSignalMessage } from "@fileshare/protocol";
 
 const port = Number(process.env.PORT || 3001);
 const roomTtlMs = 10 * 60 * 1000;
+const heartbeatIntervalMs = Number(process.env.HEARTBEAT_INTERVAL_MS || 30_000);
+const maxPayloadBytes = Number(process.env.MAX_WS_PAYLOAD_BYTES || 64 * 1024);
+const allowedOrigins = new Set(
+  (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+);
 const rooms = new Map();
 const alphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
@@ -38,20 +46,34 @@ function sendJson(socket, message) {
   }
 }
 
+function destroyRoom(code, reasonType = null) {
+  const room = rooms.get(code);
+  if (!room) return;
+
+  if (reasonType) {
+    sendJson(room.sender, { type: reasonType, payload: { code } });
+    sendJson(room.receiver, { type: reasonType, payload: { code } });
+  }
+
+  rooms.delete(code);
+}
+
 function cleanupExpiredRooms() {
   const now = Date.now();
   for (const [code, room] of rooms.entries()) {
     if (now - room.createdAt > roomTtlMs) {
-      sendJson(room.sender, { type: "room:expired", payload: { code } });
-      sendJson(room.receiver, { type: "room:expired", payload: { code } });
-      rooms.delete(code);
+      destroyRoom(code, "room:expired");
     }
   }
 }
 
 const server = createServer((request, response) => {
   if (request.url === "/health") {
-    response.writeHead(200, { "content-type": "application/json" });
+    response.writeHead(200, {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+    });
     response.end(JSON.stringify({ ok: true }));
     return;
   }
@@ -60,9 +82,24 @@ const server = createServer((request, response) => {
   response.end();
 });
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  server,
+  maxPayload: maxPayloadBytes,
+  perMessageDeflate: false,
+});
 
-wss.on("connection", (socket) => {
+wss.on("connection", (socket, request) => {
+  const origin = request.headers.origin;
+  if (allowedOrigins.size > 0 && origin && !allowedOrigins.has(origin)) {
+    socket.close(1008, "Origin not allowed");
+    return;
+  }
+
+  socket.isAlive = true;
+  socket.on("pong", () => {
+    socket.isAlive = true;
+  });
+
   socket.on("message", (raw) => {
     try {
       const message = parseSignalMessage(JSON.parse(raw.toString()));
@@ -124,7 +161,21 @@ wss.on("connection", (socket) => {
   });
 });
 
-setInterval(cleanupExpiredRooms, 30 * 1000);
+const cleanupTimer = setInterval(cleanupExpiredRooms, 30 * 1000);
+cleanupTimer.unref();
+
+const heartbeatTimer = setInterval(() => {
+  wss.clients.forEach((socket) => {
+    if (!socket.isAlive) {
+      socket.terminate();
+      return;
+    }
+
+    socket.isAlive = false;
+    socket.ping();
+  });
+}, heartbeatIntervalMs);
+heartbeatTimer.unref();
 
 server.listen(port, "0.0.0.0", () => {
   console.log(`signaling server listening on http://0.0.0.0:${port}`);

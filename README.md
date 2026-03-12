@@ -141,6 +141,27 @@ VITE_TURN_CREDENTIAL=example-password
 
 For a full production guide, including managed TURN and self-hosted coturn options, see [TURN_SETUP.md](TURN_SETUP.md).
 
+## Production defaults
+
+The frontend now uses production-oriented transport defaults:
+
+- `VITE_CHUNK_SIZE_BYTES=262144` for 256 KB file chunks
+- `VITE_MAX_BUFFERED_AMOUNT_BYTES=8388608` for 8 MB data-channel backpressure threshold
+
+The signaling server also supports these production controls:
+
+- `ALLOWED_ORIGINS` as a comma-separated allowlist of browser origins
+- `MAX_WS_PAYLOAD_BYTES` to cap incoming WebSocket payload size
+- `HEARTBEAT_INTERVAL_MS` for dead-connection cleanup
+
+Example:
+
+```bash
+ALLOWED_ORIGINS=https://your-vercel-app.vercel.app,https://mintshare.example.com
+MAX_WS_PAYLOAD_BYTES=65536
+HEARTBEAT_INTERVAL_MS=30000
+```
+
 ## Notes
 
 - WebRTC encrypts transport in transit with DTLS.

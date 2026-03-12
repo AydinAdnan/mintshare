@@ -1,10 +1,16 @@
 import { lazy, startTransition, Suspense, useEffect, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { parseControlMessage } from "@fileshare/protocol";
+import mintshareLogo from "./mintshare-logo.svg";
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 const signalUrl = import.meta.env.VITE_SIGNAL_URL || `ws://${window.location.hostname}:3001`;
-const chunkSize = 64 * 1024;
-const maxBufferedAmount = 4 * 1024 * 1024;
+const chunkSize = parsePositiveInt(import.meta.env.VITE_CHUNK_SIZE_BYTES, 256 * 1024);
+const maxBufferedAmount = parsePositiveInt(import.meta.env.VITE_MAX_BUFFERED_AMOUNT_BYTES, 8 * 1024 * 1024);
 const hasTurnConfigured = Boolean(import.meta.env.VITE_TURN_URLS?.trim());
 const roomCodeAlphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const TransferScene = lazy(() => import("./TransferScene.jsx").then((module) => ({ default: module.TransferScene })));
@@ -60,8 +66,17 @@ function createFileDescriptor(file) {
   };
 }
 
+function sumFileSizes(files) {
+  return files.reduce((total, file) => total + file.size, 0);
+}
+
 function toDownloadName(relativePath) {
   return relativePath.split("/").filter(Boolean).join("-");
+}
+
+function createArchiveName() {
+  const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 4).toUpperCase();
+  return `MintShare_${suffix}.zip`;
 }
 
 function sanitizeRoomCode(value) {
@@ -121,19 +136,49 @@ const CircularProgress = ({ progress }) => {
   );
 };
 
+function FileSummaryList({ files, activeName = "", emptyLabel }) {
+  if (!files.length) {
+    return <p className="file-list-empty">{emptyLabel}</p>;
+  }
+
+  return (
+    <div className="file-list">
+      {files.map((file) => (
+        <div key={file.id} className={`file-list-item${activeName && file.name === activeName ? " active" : ""}`}>
+          <span className="file-list-name">{file.name}</span>
+          <span className="file-list-size">{formatBytes(file.size)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function BrandHeader() {
+  return (
+    <div className="brand-header">
+      <img src={mintshareLogo} alt="MintShare logo" className="brand-logo" />
+      <div className="brand-copy">
+        <span className="brand-name">MintShare</span>
+        <span className="brand-tagline">Direct browser-to-browser file transfer</span>
+      </div>
+    </div>
+  );
+}
+
 export function App() {
-  const [uiStep, setUiStep] = useState("home"); // home, code, input, transferring, complete
+  const [uiStep, setUiStep] = useState("home"); // home, code, input, review, transferring, complete
   const [mode, setMode] = useState("sender");
   const [code, setCode] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [receivedFiles, setReceivedFiles] = useState([]);
+  const [selectedReceiveIds, setSelectedReceiveIds] = useState([]);
   const [selectedDownloadIds, setSelectedDownloadIds] = useState([]);
   const [archiveBusy, setArchiveBusy] = useState(false);
-  const [notifications, setNotifications] = useState([]);
   const [pairingMessage, setPairingMessage] = useState("");
   const [pairingError, setPairingError] = useState("");
   const [transferError, setTransferError] = useState("");
+  const [errorMessages, setErrorMessages] = useState([]);
   const [stats, setStats] = useState({
     totalBytes: 0,
     transferredBytes: 0,
@@ -153,7 +198,9 @@ export function App() {
   const transferIdRef = useRef("");
   const manifestSentRef = useRef(false);
   const transferActiveRef = useRef(false);
+  const pendingManifestRef = useRef(null);
   const joinAttemptRef = useRef("");
+  const intentionalCloseRef = useRef(false);
   const uiStepRef = useRef("home");
   const modeRef = useRef("sender");
   const receiveStateRef = useRef({
@@ -214,6 +261,29 @@ export function App() {
   }, [selectedFiles]);
 
   useEffect(() => {
+    return () => {
+      receivedFiles.forEach((file) => {
+        if (file.downloadUrl) {
+          URL.revokeObjectURL(file.downloadUrl);
+        }
+      });
+    };
+  }, [receivedFiles]);
+
+  useEffect(() => {
+    const handlePageHide = () => {
+      closeConnection();
+    };
+
+    window.addEventListener("pagehide", handlePageHide);
+    window.addEventListener("beforeunload", handlePageHide);
+    return () => {
+      window.removeEventListener("pagehide", handlePageHide);
+      window.removeEventListener("beforeunload", handlePageHide);
+    };
+  }, []);
+
+  useEffect(() => {
     if (mode !== "receiver") return;
     const completeIds = receivedFiles.filter((file) => file.status === "complete" && file.downloadUrl).map((file) => file.id);
     setSelectedDownloadIds((current) => {
@@ -235,7 +305,9 @@ export function App() {
     manifestSentRef.current = false;
     transferActiveRef.current = false;
     transferIdRef.current = "";
+    pendingManifestRef.current = null;
     setArchiveBusy(false);
+    setSelectedReceiveIds([]);
     setTransferError("");
     setStats({
       totalBytes: 0,
@@ -247,6 +319,7 @@ export function App() {
   }
 
   function closeConnection() {
+    intentionalCloseRef.current = true;
     if (controlChannelRef.current) controlChannelRef.current.close();
     if (filesChannelRef.current) filesChannelRef.current.close();
     if (peerRef.current) peerRef.current.close();
@@ -260,32 +333,46 @@ export function App() {
     joinAttemptRef.current = "";
     setCode("");
     resetRealtimeState();
+    window.setTimeout(() => {
+      intentionalCloseRef.current = false;
+    }, 0);
   }
 
   function goHome() {
+    receivedFiles.forEach((file) => {
+      if (file.downloadUrl) {
+        URL.revokeObjectURL(file.downloadUrl);
+      }
+    });
     closeConnection();
     setUiStep("home");
     setJoinCode("");
     setCode("");
     setSelectedFiles([]);
     setReceivedFiles([]);
+    setSelectedReceiveIds([]);
     setSelectedDownloadIds([]);
     setPairingMessage("");
     setPairingError("");
     setTransferError("");
+    setErrorMessages([]);
   }
 
-  function pushNotification(message, kind = "info") {
-    const id = crypto.randomUUID();
-    setNotifications((current) => [...current, { id, message, kind }]);
-    window.setTimeout(() => {
-      setNotifications((current) => current.filter((notification) => notification.id !== id));
-    }, 4200);
+  function addErrorMessage(message) {
+    if (!message) return;
+    setErrorMessages((current) => (current.includes(message) ? current : [...current, message]));
+  }
+
+  function clearErrors() {
+    setErrorMessages([]);
+    setPairingError("");
+    setTransferError("");
   }
 
   function showPairingError(message, fallbackStep = null) {
     setPairingMessage("");
     setPairingError(message);
+    addErrorMessage(message);
     if (fallbackStep) {
       setUiStep(fallbackStep);
     }
@@ -294,9 +381,23 @@ export function App() {
   function showTransferError(message, fallbackStep = "home") {
     setTransferError(message);
     setPairingMessage("");
+    addErrorMessage(message);
     if (fallbackStep) {
       setUiStep(fallbackStep);
     }
+  }
+
+  function cancelTransfer() {
+    if (controlChannelRef.current?.readyState === "open" && transferIdRef.current) {
+      sendControlMessage("transfer:error", {
+        transferId: transferIdRef.current,
+        message: modeRef.current === "sender" ? "The sender cancelled the transfer." : "The receiver cancelled the transfer.",
+      });
+    }
+
+    closeConnection();
+    addErrorMessage(modeRef.current === "sender" ? "You cancelled the transfer." : "You cancelled receiving the transfer.");
+    setUiStep("home");
   }
 
   async function saveReceivedFile(file) {
@@ -306,23 +407,10 @@ export function App() {
     }
 
     try {
-      if (navigator.share && navigator.canShare && file.blob) {
-        const shareFile = new File([file.blob], toDownloadName(file.relativePath || file.name), {
-          type: file.mimeType || file.blob.type || "application/octet-stream",
-          lastModified: file.lastModified || Date.now(),
-        });
-
-        if (navigator.canShare({ files: [shareFile] })) {
-          await navigator.share({ files: [shareFile], title: file.name });
-          return;
-        }
-      }
-
       triggerBrowserDownload(file.downloadUrl, toDownloadName(file.relativePath || file.name));
     } catch (error) {
-      if (error?.name === "AbortError") return;
       console.error(error);
-      showTransferError("Your browser could not save the received file automatically. Try again.", uiStepRef.current);
+      showTransferError("Your browser could not start the download. Try again.", uiStepRef.current);
     }
   }
 
@@ -357,7 +445,7 @@ export function App() {
       const archiveBlob = await zip.generateAsync({ type: "blob" });
       const archiveUrl = URL.createObjectURL(archiveBlob);
       try {
-        triggerBrowserDownload(archiveUrl, `fileshare-${Date.now()}.zip`);
+        triggerBrowserDownload(archiveUrl, createArchiveName());
       } finally {
         window.setTimeout(() => URL.revokeObjectURL(archiveUrl), 60_000);
       }
@@ -371,6 +459,14 @@ export function App() {
 
   function toggleDownloadSelection(fileId) {
     setSelectedDownloadIds((current) => (
+      current.includes(fileId)
+        ? current.filter((id) => id !== fileId)
+        : [...current, fileId]
+    ));
+  }
+
+  function toggleReceiveSelection(fileId) {
+    setSelectedReceiveIds((current) => (
       current.includes(fileId)
         ? current.filter((id) => id !== fileId)
         : [...current, fileId]
@@ -443,13 +539,50 @@ export function App() {
     });
   }
 
-  function acceptTransfer(manifest) {
+  function acceptTransfer(manifest, selectedFileIds) {
+    const acceptedFiles = manifest.files.filter((file) => selectedFileIds.includes(file.id));
+
+    if (acceptedFiles.length === 0) {
+      showTransferError("Select at least one file to receive.", "review");
+      return;
+    }
+
     receiveStateRef.current.transferId = manifest.transferId;
     receiveStateRef.current.receivedBytes = 0;
     receiveStateRef.current.startedAt = Date.now();
     receiveStateRef.current.lastCheckpointAt = Date.now();
-    if (!sendControlMessage("transfer:accept", { transferId: manifest.transferId })) return;
+    transferIdRef.current = manifest.transferId;
+
+    setReceivedFiles(
+      acceptedFiles.map((file) => ({
+        ...file,
+        receivedBytes: 0,
+        status: "pending",
+        blob: null,
+        downloadUrl: "",
+      }))
+    );
+    setStats((current) => ({
+      ...current,
+      totalBytes: sumFileSizes(acceptedFiles),
+      transferredBytes: 0,
+      bytesPerSecond: 0,
+      etaSeconds: null,
+      currentFileName: acceptedFiles.length === 1 ? acceptedFiles[0].name : `${acceptedFiles.length} files selected`,
+    }));
+
+    if (!sendControlMessage("transfer:accept", { transferId: manifest.transferId, selectedFileIds })) return;
+    pendingManifestRef.current = null;
     setUiStep("transferring");
+  }
+
+  function handleReceiveSelectedFiles() {
+    if (!pendingManifestRef.current) {
+      showTransferError("No transfer is waiting for your selection.", "input");
+      return;
+    }
+
+    acceptTransfer(pendingManifestRef.current, selectedReceiveIds);
   }
 
   function handleControlChannelMessage(rawMessage) {
@@ -457,6 +590,7 @@ export function App() {
       const message = parseControlMessage(JSON.parse(rawMessage.data));
 
       if (message.type === "transfer:manifest") {
+        pendingManifestRef.current = message.payload;
         setReceivedFiles(
           message.payload.files.map((file) => ({
             ...file,
@@ -466,18 +600,39 @@ export function App() {
             downloadUrl: "",
           }))
         );
+        setSelectedReceiveIds([]);
         setStats((current) => ({
           ...current,
           totalBytes: message.payload.totalBytes,
           transferredBytes: 0,
+          bytesPerSecond: 0,
+          etaSeconds: null,
+          currentFileName: "",
         }));
-        acceptTransfer(message.payload); // Auto accept to make it seamless
+        setUiStep("review");
         return;
       }
 
       if (message.type === "transfer:accept") {
+        const acceptedIds = new Set(message.payload.selectedFileIds);
+        const acceptedFiles = filesRef.current.filter((file) => acceptedIds.has(file.id));
+
+        if (acceptedFiles.length === 0) {
+          showTransferError("The receiver did not select any files.", "code");
+          return;
+        }
+
+        transferIdRef.current = message.payload.transferId;
+        setStats((current) => ({
+          ...current,
+          totalBytes: sumFileSizes(acceptedFiles),
+          transferredBytes: 0,
+          bytesPerSecond: 0,
+          etaSeconds: null,
+          currentFileName: acceptedFiles.length === 1 ? acceptedFiles[0].name : `${acceptedFiles.length} files selected`,
+        }));
         setUiStep("transferring");
-        void sendSelectedFiles(message.payload.transferId);
+        void sendSelectedFiles(message.payload.transferId, message.payload.selectedFileIds);
         return;
       }
 
@@ -525,7 +680,7 @@ export function App() {
       }
 
       if (message.type === "transfer:error") {
-        showTransferError(message.payload.message || "Transfer failed.");
+        showTransferError(message.payload.message || "Transfer failed.", "home");
       }
     } catch (error) {
       console.error(error);
@@ -576,13 +731,12 @@ export function App() {
     channel.onmessage = handleControlChannelMessage;
     channel.onerror = () => {
       showTransferError("The control channel failed during transfer setup.");
-      pushNotification("The control connection failed.", "error");
     };
     channel.onclose = () => {
+      if (intentionalCloseRef.current) return;
       if (uiStepRef.current === "complete") return;
       if (transferActiveRef.current || uiStepRef.current === "transferring") {
         showTransferError("The connection to the other device was lost during transfer.");
-        pushNotification("The other device ended the transfer.", "error");
       }
     };
   }
@@ -599,13 +753,12 @@ export function App() {
     channel.onmessage = handleDataChannelMessage;
     channel.onerror = () => {
       showTransferError("The file data channel failed.");
-      pushNotification("The file channel failed.", "error");
     };
     channel.onclose = () => {
+      if (intentionalCloseRef.current) return;
       if (uiStepRef.current === "complete") return;
       if (transferActiveRef.current || uiStepRef.current === "transferring") {
         showTransferError("The file transfer stopped because the data channel closed.");
-        pushNotification("The file transfer was terminated.", "error");
       }
     };
   }
@@ -625,13 +778,12 @@ export function App() {
     peer.onconnectionstatechange = () => {
       if (peer.connectionState === "failed") {
         showTransferError("Peer connection failed. The devices could not establish a direct link.");
-        pushNotification("Peer connection failed.", "error");
       }
 
       if (peer.connectionState === "disconnected") {
+        if (intentionalCloseRef.current) return;
         if (uiStepRef.current === "complete") return;
         showTransferError("The other device disconnected.");
-        pushNotification("The other device disconnected.", "error");
       }
     };
 
@@ -676,7 +828,7 @@ export function App() {
         roomCodeRef.current = message.payload.code;
         setCode(message.payload.code);
         setPairingMessage("Scan the QR code or enter the code on the other device.");
-        setPairingError("");
+        clearErrors();
         setUiStep("code");
         return;
       }
@@ -689,7 +841,7 @@ export function App() {
         roomCodeRef.current = message.payload.code;
         setCode(message.payload.code);
         setPairingMessage("Connected. Waiting for sender...");
-        setPairingError("");
+        clearErrors();
         setupPeerConnection(false);
         return;
       }
@@ -700,7 +852,6 @@ export function App() {
       }
       if (message.type === "room:expired" || message.type === "room:peer-left") {
         showPairingError(message.type === "room:peer-left" ? "The other device left." : "This code expired.", modeRef.current === "sender" ? "home" : "input");
-        pushNotification(message.type === "room:peer-left" ? "The other device terminated the connection." : "The pairing code expired.", "error");
         joinAttemptRef.current = "";
         return;
       }
@@ -735,6 +886,7 @@ export function App() {
   function connectSocket(nextMode, specificCode = null) {
     closeConnection();
     setMode(nextMode);
+    clearErrors();
     setPairingError("");
     setPairingMessage(nextMode === "sender" ? "Creating a secure connection..." : "Connecting...");
     if (nextMode === "sender") {
@@ -766,19 +918,17 @@ export function App() {
     });
     socket.addEventListener("error", () => {
       showPairingError("Unable to reach the pairing server.", nextMode === "sender" ? "home" : "input");
-      pushNotification("The pairing server could not be reached.", "error");
     });
     socket.addEventListener("close", () => {
+      if (intentionalCloseRef.current) return;
       if (transferActiveRef.current) return;
       if (uiStepRef.current === "complete") return;
       if (nextMode === "sender" && !roomCodeRef.current) {
         showPairingError("Connection closed before a pairing code was created.", "home");
-        pushNotification("The sender connection was closed.", "error");
         return;
       }
       if (uiStepRef.current === "code" || uiStepRef.current === "input") {
         showPairingError("Pairing server connection was closed.", nextMode === "sender" ? "home" : "input");
-        pushNotification("The pairing connection was closed.", "error");
       }
     });
   }
@@ -799,16 +949,23 @@ export function App() {
     setStats((current) => ({ ...current, totalBytes: manifest.totalBytes }));
   }
 
-  async function sendSelectedFiles(transferId) {
+  async function sendSelectedFiles(transferId, selectedFileIds = []) {
     if (transferActiveRef.current || filesChannelRef.current?.readyState !== "open") return;
     transferActiveRef.current = true;
     const channel = filesChannelRef.current;
     const startedAt = Date.now();
-    const totalBytes = filesRef.current.reduce((total, file) => total + file.size, 0);
+    const filesToSend = selectedFileIds.length > 0
+      ? filesRef.current.filter((file) => selectedFileIds.includes(file.id))
+      : filesRef.current;
+    const totalBytes = sumFileSizes(filesToSend);
     let transferredBytes = 0;
 
     try {
-      for (const fileDescriptor of filesRef.current) {
+      if (filesToSend.length === 0) {
+        throw new Error("The receiver did not approve any files for transfer.");
+      }
+
+      for (const fileDescriptor of filesToSend) {
         if (!sendControlMessage("file:start", { transferId, ...fileDescriptor, file: undefined })) return;
         for (let offset = 0; offset < fileDescriptor.size; offset += chunkSize) {
           const chunk = await fileDescriptor.file.slice(offset, offset + chunkSize).arrayBuffer();
@@ -832,10 +989,11 @@ export function App() {
   function handleFileSelection(event) {
     const nextFiles = Array.from(event.target.files || []).map(createFileDescriptor);
     if (nextFiles.length > 0) {
+      clearErrors();
       setSelectedFiles(nextFiles);
       setStats((current) => ({
         ...current,
-        totalBytes: nextFiles.reduce((total, file) => total + file.size, 0),
+        totalBytes: sumFileSizes(nextFiles),
         transferredBytes: 0,
         currentFileName: nextFiles.length === 1 ? nextFiles[0].name : `${nextFiles.length} files selected`,
       }));
@@ -857,7 +1015,10 @@ export function App() {
   const progressRatio = stats.totalBytes > 0 ? stats.transferredBytes / stats.totalBytes : 0;
   const qrValue = code ? `${window.location.origin}/#join=${code}` : "";
   const completedReceivedFiles = receivedFiles.filter((file) => file.status === "complete" && file.downloadUrl);
+  const selectedReceiveFiles = receivedFiles.filter((file) => selectedReceiveIds.includes(file.id));
   const selectedCompleteFiles = completedReceivedFiles.filter((file) => selectedDownloadIds.includes(file.id));
+  const displayErrors = Array.from(new Set([pairingError, transferError, ...errorMessages].filter(Boolean)));
+  const shouldShowBrandHeader = !(mode === "sender" && selectedFiles.length > 0 && ["code", "transferring", "complete"].includes(uiStep));
 
   return (
     <main className="app-main">
@@ -866,25 +1027,18 @@ export function App() {
       </Suspense>
 
       <div className="overlay-ui">
-        {notifications.length > 0 ? (
-          <div className="toast-stack" aria-live="polite" aria-atomic="true">
-            {notifications.map((notification) => (
-              <div key={notification.id} className={`toast toast-${notification.kind}`}>
-                <span>{notification.message}</span>
-                <button type="button" className="toast-close" onClick={() => setNotifications((current) => current.filter((item) => item.id !== notification.id))}>
-                  Close
-                </button>
-              </div>
-            ))}
-          </div>
-        ) : null}
+        {shouldShowBrandHeader ? <BrandHeader /> : null}
 
         {uiStep === "home" && (
           <div className="card fade-in home-card">
-            <h1>Share</h1>
             <p>Direct peer-to-peer file transfer.</p>
-            {pairingError ? <p className="error-text error-block">{pairingError}</p> : null}
-            {transferError ? <p className="error-text error-block">{transferError}</p> : null}
+            {displayErrors.length > 0 ? (
+              <div className="error-block">
+                {displayErrors.map((message) => (
+                  <p key={message} className="error-text">{message}</p>
+                ))}
+              </div>
+            ) : null}
             <div className="action-buttons">
               <label className="primary-btn button-label" htmlFor="file-input">
                 Send Files
@@ -905,9 +1059,21 @@ export function App() {
             <div className="qr-container">
               {qrValue ? <QRCodeSVG value={qrValue} size={160} includeMargin bgColor="#ffffff" fgColor="#000000" /> : <div className="qr-placeholder">Creating code...</div>}
             </div>
-            {selectedFiles.length > 0 ? <p className="status-text">{selectedFiles.length === 1 ? selectedFiles[0].name : `${selectedFiles.length} files selected`}</p> : null}
+            {selectedFiles.length > 0 ? (
+              <div className="selection-panel">
+                <p className="status-text">{selectedFiles.length === 1 ? "1 file selected" : `${selectedFiles.length} files selected`}</p>
+                <FileSummaryList files={selectedFiles} emptyLabel="No files selected." />
+              </div>
+            ) : null}
             <p className="status-text">{pairingMessage || "Waiting for the other device..."}</p>
-            {pairingError ? <p className="error-text">{pairingError}</p> : null}
+            {displayErrors.length > 0 ? (
+              <div className="error-block">
+                {displayErrors.map((message) => (
+                  <p key={message} className="error-text">{message}</p>
+                ))}
+              </div>
+            ) : null}
+            {displayErrors.length > 0 ? <button className="secondary-btn" type="button" onClick={goHome}>Back to Home</button> : null}
             <button className="text-btn" type="button" onClick={goHome}>Cancel</button>
           </div>
         )}
@@ -929,7 +1095,77 @@ export function App() {
               inputMode="text"
             />
             <p className="status-text">{pairingMessage}</p>
-            {pairingError ? <p className="error-text">{pairingError}</p> : null}
+            {displayErrors.length > 0 ? (
+              <div className="error-block">
+                {displayErrors.map((message) => (
+                  <p key={message} className="error-text">{message}</p>
+                ))}
+              </div>
+            ) : null}
+            {displayErrors.length > 0 ? <button className="secondary-btn" type="button" onClick={goHome}>Back to Home</button> : null}
+            <button className="text-btn" type="button" onClick={goHome}>Cancel</button>
+          </div>
+        )}
+
+        {uiStep === "review" && (
+          <div className="card scale-in">
+            <h2>Choose Files to Receive</h2>
+            <p>Select the files you want. The sender will only transfer the files you approve.</p>
+            <div className="download-actions">
+              <div className="download-list">
+                {receivedFiles.map((file) => (
+                  <label key={file.id} className="download-item">
+                    <input
+                      type="checkbox"
+                      checked={selectedReceiveIds.includes(file.id)}
+                      onChange={() => toggleReceiveSelection(file.id)}
+                    />
+                    <span className="download-item-text">
+                      <strong>{file.name}</strong>
+                      <span>{formatBytes(file.size)}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+              <p className="complete-note review-note">
+                {selectedReceiveFiles.length > 0
+                  ? `${selectedReceiveFiles.length} file${selectedReceiveFiles.length === 1 ? "" : "s"} selected for transfer.`
+                  : "Choose at least one file to start the transfer."}
+              </p>
+              <div className="download-toolbar">
+                <button
+                  className="secondary-btn download-button"
+                  type="button"
+                  onClick={() => setSelectedReceiveIds(receivedFiles.map((file) => file.id))}
+                  disabled={receivedFiles.length === 0}
+                >
+                  Select All
+                </button>
+                <button
+                  className="secondary-btn download-button"
+                  type="button"
+                  onClick={() => setSelectedReceiveIds([])}
+                  disabled={selectedReceiveIds.length === 0}
+                >
+                  Clear Selection
+                </button>
+                <button
+                  className="primary-btn download-button"
+                  type="button"
+                  onClick={handleReceiveSelectedFiles}
+                  disabled={selectedReceiveIds.length === 0}
+                >
+                  Receive Selected ({selectedReceiveFiles.length})
+                </button>
+              </div>
+            </div>
+            {displayErrors.length > 0 ? (
+              <div className="error-block">
+                {displayErrors.map((message) => (
+                  <p key={message} className="error-text">{message}</p>
+                ))}
+              </div>
+            ) : null}
             <button className="text-btn" type="button" onClick={goHome}>Cancel</button>
           </div>
         )}
@@ -937,8 +1173,16 @@ export function App() {
         {uiStep === "transferring" && (
           <div className="card glass-card transfer-card float-in">
             <h2>{mode === 'sender' ? 'Uploading' : 'Downloading'}</h2>
-            <p className="filename">{stats.currentFileName}</p>
-            {transferError ? <p className="error-text error-block">{transferError}</p> : null}
+            <p className="filename">{stats.currentFileName || (mode === "sender" ? "Preparing files" : "Receiving files")}</p>
+            {mode === "sender" && selectedFiles.length > 1 ? <FileSummaryList files={selectedFiles} activeName={stats.currentFileName} emptyLabel="No files selected." /> : null}
+            {mode === "receiver" && receivedFiles.length > 0 ? <FileSummaryList files={receivedFiles} activeName={stats.currentFileName} emptyLabel="Waiting for files." /> : null}
+            {displayErrors.length > 0 ? (
+              <div className="error-block">
+                {displayErrors.map((message) => (
+                  <p key={message} className="error-text">{message}</p>
+                ))}
+              </div>
+            ) : null}
             <CircularProgress progress={progressRatio} />
             <div className="transfer-stats">
               <div>
@@ -954,6 +1198,10 @@ export function App() {
                 <strong>{formatBytes(stats.transferredBytes)} / {formatBytes(stats.totalBytes)}</strong>
               </div>
             </div>
+            <div className="action-buttons compact-actions">
+              <button className="secondary-btn" type="button" onClick={cancelTransfer}>Cancel Transfer</button>
+              {displayErrors.length > 0 ? <button className="text-btn" type="button" onClick={goHome}>Back to Home</button> : null}
+            </div>
           </div>
         )}
 
@@ -964,7 +1212,7 @@ export function App() {
             <p>{mode === 'sender' ? 'Your files have been successfully sent.' : 'Choose which received files you want to save.'}</p>
             {mode === "receiver" && completedReceivedFiles.length > 0 ? (
               <div className="download-actions">
-                <p className="complete-note">Select files below, then download them individually or as a zip archive.</p>
+                <p className="complete-note">Select files below. Nothing will download until you press a download button.</p>
                 <div className="download-list">
                   {completedReceivedFiles.map((file) => (
                     <label key={file.id} className="download-item">
@@ -986,7 +1234,7 @@ export function App() {
                           void saveReceivedFile(file);
                         }}
                       >
-                        Save
+                        Download
                       </button>
                     </label>
                   ))}
