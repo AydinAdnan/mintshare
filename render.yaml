@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: fileshare-signal
+    runtime: node
+    rootDir: .
+    plan: free
+    buildCommand: npm install
+    startCommand: npm run start --workspace @fileshare/signal
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
