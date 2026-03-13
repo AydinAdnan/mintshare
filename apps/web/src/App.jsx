@@ -210,6 +210,10 @@ export function App() {
     currentFileId: null,
     currentFileMeta: null,
     chunks: new Map(),
+    fileMetaById: new Map(),
+    fileBytesReceived: new Map(),
+    endedFileIds: new Set(),
+    transferCompleteSignaled: false,
     receivedBytes: 0,
     startedAt: 0,
     lastCheckpointAt: 0,
@@ -569,6 +573,53 @@ export function App() {
     });
   }
 
+  function maybeCompleteIncomingTransfer() {
+    const currentReceive = receiveStateRef.current;
+    if (!currentReceive.transferCompleteSignaled) return;
+    if (!currentReceive.acceptedFileIds.length) return;
+
+    const allFilesDone = currentReceive.acceptedFileIds.every((fileId) => {
+      const fileMeta = currentReceive.fileMetaById.get(fileId);
+      const receivedBytes = currentReceive.fileBytesReceived.get(fileId) || 0;
+      return Boolean(fileMeta) && currentReceive.endedFileIds.has(fileId) && receivedBytes >= fileMeta.size;
+    });
+
+    if (allFilesDone) {
+      setUiStep("complete");
+      setStats((current) => ({ ...current, etaSeconds: 0 }));
+    }
+  }
+
+  function maybeFinalizeReceivedFile(fileId) {
+    const currentReceive = receiveStateRef.current;
+    const fileMeta = currentReceive.fileMetaById.get(fileId);
+    if (!fileMeta) return;
+
+    const receivedBytes = currentReceive.fileBytesReceived.get(fileId) || 0;
+    if (receivedBytes < fileMeta.size) return;
+
+    const chunks = currentReceive.chunks.get(fileId) || [];
+    const blob = new Blob(chunks, { type: "application/octet-stream" });
+    if (blob.size < fileMeta.size) return;
+
+    const downloadUrl = URL.createObjectURL(blob);
+    upsertReceivedFile({
+      id: fileId,
+      blob,
+      downloadUrl,
+      status: "complete",
+      receivedBytes,
+    });
+
+    currentReceive.chunks.delete(fileId);
+    if (currentReceive.currentFileId === fileId) {
+      currentReceive.currentFileId = null;
+      currentReceive.currentFileMeta = null;
+    }
+
+    maybeCompleteIncomingTransfer();
+  }
+
   function acceptTransfer(manifest, selectedFileIds) {
     const acceptedFiles = manifest.files.filter((file) => selectedFileIds.includes(file.id));
 
@@ -579,6 +630,10 @@ export function App() {
 
     receiveStateRef.current.transferId = manifest.transferId;
     receiveStateRef.current.acceptedFileIds = selectedFileIds;
+    receiveStateRef.current.fileMetaById = new Map(acceptedFiles.map((file) => [file.id, file]));
+    receiveStateRef.current.fileBytesReceived = new Map();
+    receiveStateRef.current.endedFileIds = new Set();
+    receiveStateRef.current.transferCompleteSignaled = false;
     receiveStateRef.current.receivedBytes = 0;
     receiveStateRef.current.startedAt = Date.now();
     receiveStateRef.current.lastCheckpointAt = Date.now();
@@ -694,6 +749,9 @@ export function App() {
         receiveStateRef.current.currentFileId = message.payload.id;
         receiveStateRef.current.currentFileMeta = message.payload;
         receiveStateRef.current.chunks.set(message.payload.id, []);
+        receiveStateRef.current.fileMetaById.set(message.payload.id, message.payload);
+        receiveStateRef.current.fileBytesReceived.set(message.payload.id, 0);
+        receiveStateRef.current.endedFileIds.delete(message.payload.id);
         upsertReceivedFile({
           id: message.payload.id,
           name: message.payload.name,
@@ -716,26 +774,15 @@ export function App() {
           console.warn("Rejected file:end with mismatched transferId");
           return;
         }
-        const fileMeta = currentReceive.currentFileMeta;
-        const chunks = currentReceive.chunks.get(message.payload.fileId) || [];
-        const blob = new Blob(chunks, { type: "application/octet-stream" });
-        const downloadUrl = URL.createObjectURL(blob);
-        upsertReceivedFile({
-          id: message.payload.fileId,
-          blob,
-          downloadUrl,
-          status: "complete",
-          receivedBytes: fileMeta?.size || blob.size,
-        });
-        currentReceive.currentFileId = null;
-        currentReceive.currentFileMeta = null;
+        currentReceive.endedFileIds.add(message.payload.fileId);
+        maybeFinalizeReceivedFile(message.payload.fileId);
 
         return;
       }
 
       if (message.type === "transfer:complete") {
-        setUiStep("complete");
-        setStats((current) => ({ ...current, etaSeconds: 0 }));
+        receiveStateRef.current.transferCompleteSignaled = true;
+        maybeCompleteIncomingTransfer();
         return;
       }
 
@@ -758,18 +805,20 @@ export function App() {
     if (!currentReceive.currentFileId || !currentReceive.currentFileMeta) return;
 
     // Memory exhaustion guard: reject chunks that exceed the declared file size
-    const fileMeta = currentReceive.currentFileMeta;
-    const existingChunks = currentReceive.chunks.get(currentReceive.currentFileId) || [];
-    const alreadyReceived = existingChunks.reduce((total, chunk) => total + chunk.byteLength, 0);
-    if (fileMeta && alreadyReceived + event.data.byteLength > fileMeta.size + MAX_OVERSIZE_BYTES) {
+    const fileId = currentReceive.currentFileId;
+    const fileMeta = currentReceive.fileMetaById.get(fileId) || currentReceive.currentFileMeta;
+    const alreadyReceived = currentReceive.fileBytesReceived.get(fileId) || 0;
+    const nextFileBytes = alreadyReceived + event.data.byteLength;
+    if (fileMeta && nextFileBytes > fileMeta.size + MAX_OVERSIZE_BYTES) {
       showTransferError("Transfer aborted: sender sent more data than declared. Possible attack.");
       cancelTransfer();
       return;
     }
 
-    const chunks = currentReceive.chunks.get(currentReceive.currentFileId) || [];
+    const chunks = currentReceive.chunks.get(fileId) || [];
     chunks.push(event.data);
-    currentReceive.chunks.set(currentReceive.currentFileId, chunks);
+    currentReceive.chunks.set(fileId, chunks);
+    currentReceive.fileBytesReceived.set(fileId, nextFileBytes);
     currentReceive.receivedBytes += event.data.byteLength;
 
     const now = Date.now();
@@ -783,8 +832,8 @@ export function App() {
       currentReceive.lastCheckpointBytes = currentReceive.receivedBytes;
 
       upsertReceivedFile({
-        id: currentReceive.currentFileId,
-        receivedBytes: chunks.reduce((total, chunk) => total + chunk.byteLength, 0),
+        id: fileId,
+        receivedBytes: nextFileBytes,
         status: "receiving",
       });
       setStats((current) => ({
@@ -793,6 +842,10 @@ export function App() {
         bytesPerSecond,
         etaSeconds,
       }));
+    }
+
+    if (currentReceive.endedFileIds.has(fileId)) {
+      maybeFinalizeReceivedFile(fileId);
     }
   }
 
@@ -839,7 +892,10 @@ export function App() {
   function setupPeerConnection(isInitiator) {
     if (peerRef.current) return peerRef.current;
 
-    const peer = new RTCPeerConnection(createRtcConfig());
+    const peer = new RTCPeerConnection({
+      ...createRtcConfig(),
+      iceCandidatePoolSize: 10,
+    });
     peerRef.current = peer;
 
     peer.onicecandidate = (event) => {
@@ -1219,14 +1275,6 @@ export function App() {
                   Select All
                 </button>
                 <button
-                  className="secondary-btn download-button"
-                  type="button"
-                  onClick={() => setSelectedReceiveIds([])}
-                  disabled={selectedReceiveIds.length === 0}
-                >
-                  Clear Selection
-                </button>
-                <button
                   className="primary-btn download-button"
                   type="button"
                   onClick={handleReceiveSelectedFiles}
@@ -1327,7 +1375,7 @@ export function App() {
               </div>
             ) : null}
             {transferError ? <p className="error-text error-block">{transferError}</p> : null}
-            <button className="primary-btn mt" onClick={goHome}>Done</button>
+            <button className="primary-btn mt" onClick={goHome}>Go Back</button>
           </div>
         )}
       </div>

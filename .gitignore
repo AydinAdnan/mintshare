@@ -10,3 +10,4 @@ coverage
 *.log
 apps/web/dist
 apps/signal/dist
+TURN_SETUP.md
