@@ -384,7 +384,7 @@ button:hover, .button-label:hover {
 
 .download-item {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 0.75rem;
   width: 100%;
@@ -401,7 +401,6 @@ button:hover, .button-label:hover {
 .download-item-text {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
   gap: 0.15rem;
   min-width: 0;
 }
@@ -411,6 +410,7 @@ button:hover, .button-label:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  max-width: 100%;
 }
 
 .download-item-text strong {
@@ -426,6 +426,7 @@ button:hover, .button-label:hover {
 .download-inline-button {
   padding: 0.55rem 0.9rem;
   font-size: 0.85rem;
+  flex-shrink: 0;
 }
 
 .download-button {

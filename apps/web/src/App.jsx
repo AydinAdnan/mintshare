@@ -1,12 +1,11 @@
 import { lazy, startTransition, Suspense, useEffect, useRef, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { parseControlMessage } from "@fileshare/protocol";
-import mintshareLogo from "./mintshare-logo.svg";
-
-function parsePositiveInt(value, fallback) {
-  const parsed = Number.parseInt(value ?? "", 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
+import { parsePositiveInt, formatBytes, formatRate, formatEta } from "./utils/format.js";
+import { createFileDescriptor, sumFileSizes, toDownloadName, createArchiveName, triggerBrowserDownload } from "./utils/files.js";
+import { CircularProgress } from "./components/CircularProgress.jsx";
+import { FileSummaryList } from "./components/FileSummaryList.jsx";
+import { BrandHeader } from "./components/BrandHeader.jsx";
 
 const signalUrl = import.meta.env.VITE_SIGNAL_URL || `ws://${window.location.hostname}:3001`;
 const chunkSize = parsePositiveInt(import.meta.env.VITE_CHUNK_SIZE_BYTES, 256 * 1024);
@@ -33,52 +32,6 @@ function createRtcConfig() {
   return { iceServers };
 }
 
-function formatBytes(bytes) {
-  if (!bytes) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / 1024 ** exponent;
-  return `${value.toFixed(value >= 100 || exponent === 0 ? 0 : 1)} ${units[exponent]}`;
-}
-
-function formatRate(bytesPerSecond) {
-  if (!bytesPerSecond) return "0 B/s";
-  return `${formatBytes(bytesPerSecond)}/s`;
-}
-
-function formatEta(seconds) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "--";
-  if (seconds < 60) return `${Math.ceil(seconds)}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = Math.ceil(seconds % 60);
-  return `${minutes}m ${remainingSeconds}s`;
-}
-
-function createFileDescriptor(file) {
-  return {
-    id: crypto.randomUUID(),
-    name: file.name,
-    relativePath: file.webkitRelativePath || file.name,
-    mimeType: file.type || "application/octet-stream",
-    size: file.size,
-    lastModified: file.lastModified,
-    file,
-  };
-}
-
-function sumFileSizes(files) {
-  return files.reduce((total, file) => total + file.size, 0);
-}
-
-function toDownloadName(relativePath) {
-  return relativePath.split("/").filter(Boolean).join("-");
-}
-
-function createArchiveName() {
-  const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 4).toUpperCase();
-  return `MintShare_${suffix}.zip`;
-}
-
 function sanitizeRoomCode(value) {
   return value
     .toUpperCase()
@@ -86,83 +39,6 @@ function sanitizeRoomCode(value) {
     .filter((character) => roomCodeAlphabet.includes(character))
     .join("")
     .slice(0, 6);
-}
-
-function triggerBrowserDownload(url, fileName) {
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = fileName;
-  link.rel = "noopener";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-}
-
-const CircularProgress = ({ progress }) => {
-  const radius = 100;
-  const stroke = 12;
-  const normalizedRadius = radius - stroke * 2;
-  const circumference = normalizedRadius * 2 * Math.PI;
-  const strokeDashoffset = circumference - progress * circumference;
-
-  return (
-    <div className="circular-progress">
-      <svg height={radius * 2} width={radius * 2}>
-        <circle
-          stroke="rgba(255,255,255,0.05)"
-          fill="transparent"
-          strokeWidth={stroke}
-          r={normalizedRadius}
-          cx={radius}
-          cy={radius}
-        />
-        <circle
-          stroke="#ffffff"
-          fill="transparent"
-          strokeWidth={stroke}
-          strokeDasharray={circumference + " " + circumference}
-          style={{ strokeDashoffset, transition: "stroke-dashoffset 0.1s linear" }}
-          strokeLinecap="round"
-          r={normalizedRadius}
-          cx={radius}
-          cy={radius}
-          transform={`rotate(-90 ${radius} ${radius})`}
-        />
-      </svg>
-      <div className="progress-content">
-        <h2>{Math.round(progress * 100)}%</h2>
-      </div>
-    </div>
-  );
-};
-
-function FileSummaryList({ files, activeName = "", emptyLabel }) {
-  if (!files.length) {
-    return <p className="file-list-empty">{emptyLabel}</p>;
-  }
-
-  return (
-    <div className="file-list">
-      {files.map((file) => (
-        <div key={file.id} className={`file-list-item${activeName && file.name === activeName ? " active" : ""}`}>
-          <span className="file-list-name">{file.name}</span>
-          <span className="file-list-size">{formatBytes(file.size)}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function BrandHeader() {
-  return (
-    <div className="brand-header">
-      <img src={mintshareLogo} alt="MintShare logo" className="brand-logo" />
-      <div className="brand-copy">
-        <span className="brand-name">MintShare</span>
-        <span className="brand-tagline">Direct browser-to-browser file transfer</span>
-      </div>
-    </div>
-  );
 }
 
 export function App() {
@@ -1028,6 +904,7 @@ export function App() {
     socketRef.current = socket;
 
     socket.addEventListener("open", () => {
+      if (socket !== socketRef.current) return;
       if (nextMode === "sender") {
         socket.send(JSON.stringify({ type: "room:create", payload: { role: "sender" } }));
       } else {
@@ -1040,6 +917,7 @@ export function App() {
       }
     });
     socket.addEventListener("message", (event) => {
+      if (socket !== socketRef.current) return;
       try {
         void handleSignalingMessage(JSON.parse(event.data));
       } catch (error) {
@@ -1048,9 +926,11 @@ export function App() {
       }
     });
     socket.addEventListener("error", () => {
+      if (socket !== socketRef.current) return;
       showPairingError("Unable to reach the pairing server.", nextMode === "sender" ? "home" : "input");
     });
     socket.addEventListener("close", () => {
+      if (socket !== socketRef.current) return;
       if (intentionalCloseRef.current) return;
       if (transferActiveRef.current) return;
       if (uiStepRef.current === "complete") return;
